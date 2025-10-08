@@ -11,6 +11,7 @@ from a2a.types import AgentCard, SendMessageRequest, MessageSendParams, SendMess
 from google.genai.types import Content, Part 
 from a2a.client.card_resolver import A2ACardResolver
 from .remote_agent_connection import RemoteAgentConnection
+from .tools import book_court, list_court_availabilities
 import datetime
 import json
 import httpx
@@ -92,7 +93,11 @@ class HostAgent:
             model="gemini-2.5-flash-lite",
             description="This Host agent orchestrates scheduling pickleball with friends",
             instruction=self.get_instruction,
-            tools=[]
+            tools=[
+                self.send_message,
+                list_court_availabilities,
+                book_court,
+            ]
         )
 
     def get_instruction(self, context:ReadonlyContext)->str:
