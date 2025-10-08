@@ -1,11 +1,14 @@
+import asyncio
+import uuid
 from google.adk.agents import Agent
 from google.adk.runners import Runner
 from google.adk.artifacts import InMemoryArtifactService
 from google.adk.memory import InMemoryMemoryService
 from google.adk.sessions import InMemorySessionService
 from google.adk.agents.readonly_context import ReadonlyContext
-
-from a2a.types import AgentCard
+from google.adk.tools.tool_context import ToolContext
+from a2a.types import AgentCard, SendMessageRequest, MessageSendParams, SendMessageResponse, SendMessageSuccessResponse, Task
+from google.genai.types import Content, Part 
 from a2a.client.card_resolver import A2ACardResolver
 from .remote_agent_connection import RemoteAgentConnection
 import datetime
@@ -76,7 +79,7 @@ class HostAgent:
                     print(f"ERROR: Failed to get agent card from {address}: {e}")
                 except Exception as e:
                     print(f"ERROR: Failed to initialize connection for {address}: {e}")
-            
+
         agent_info = [
             json.dumps({"name": card.name, "description": card.description}) for card in self.cards.values()
         ]
@@ -118,3 +121,116 @@ class HostAgent:
         {self.agents}
         </Available Agents>
         """
+
+    async def stream(self, query:str, session_id:str):
+        session = await self._runner.session_service.get_session(
+            app_name=self._agent.name, user_id=self._user_id, session_id=session_id
+        )
+        content = Content(role="user",parts=[Part.from_text(text=query)])
+        if session is None:
+            session = await self._runner.session_service.create_session(
+                app_name=self._agent.name,
+                user_id=self._user_id,
+                state={},
+                session_id=session_id,
+            )
+        
+        async for event in self._runner.run_async(
+            user_id=self._user_id, session_id = session_id, new_message=content
+        ):
+            if event.is_final_response():
+                # Yield the final response content when processing is complete, otherwise stream a "thinking" status update.
+                response = ""
+                if (
+                    event.content
+                    and event.content.parts
+                    and event.content.parts[0].text
+                ):
+                    response = "\n".join(
+                        [p.text for p in event.content.parts if p.text]
+                    )
+                yield {
+                    "is_task_complete": True,
+                    "content": response,
+                }
+            else:
+                yield {
+                    "is_task_complete": False,
+                    "updates": "The host agent is thinking...",
+                }
+
+    async def send_message(self, agent_name:str, task:str, tool_context:ToolContext):
+        if agent_name not in self.remote_agent_connections:
+            raise ValueError("no such agent exists")
+        client = self.remote_agent_connections[agent_name]
+        if not client:
+            raise ValueError("client not found")
+        state = tool_context.state
+        task_id = state.get("task_id",str(uuid.uuid4()))
+        context_id = state.get("context_id",str(uuid.uuid4()))
+        message_id = str(uuid.uuid4())
+
+        payload = {
+            "message":{
+                "role":"user",
+                "parts":[{"type":"text", "text":task}],
+                "messageId":message_id,
+                "taskId":task_id,
+                "contextId":context_id
+            },
+        }       
+
+        message_request = SendMessageRequest(
+            id=message_id,
+            params=MessageSendParams.model_validate(payload)
+        )
+        send_message_response : SendMessageResponse = await client.send_message(message_request=message_request)
+        print("send_response", send_message_response)
+        if not isinstance(
+            send_message_response.root, SendMessageSuccessResponse
+        ) or not isinstance(send_message_response.root.result, Task):
+            print("Received a non-success or non-task response. Cannot proceed.")
+            return
+
+        response_content = send_message_response.root.model_dump_json(exclude_none=True)
+        json_content = json.loads(response_content)
+        resp = []
+
+        # This block navigates the nested JSON structure by first checking for 
+        # "result" and "artifacts" keys. For each artifact found, if it contains 
+        # a "parts" field, those parts are added to the resp list.
+
+        if json_content.get("result", {}).get("artifacts"):
+            for artifact in json_content["result"]["artifacts"]:
+                if artifact.get("parts"):
+                    resp.extend(artifact["parts"])
+        return resp
+
+
+def _get_initialized_host_agent():
+    async def _async_main():
+        friend_agent_urls = [
+            "http://localhost:10002",  # uno's Agent
+            "http://localhost:10003",  # dos's Agent
+            "http://localhost:10004",  # tres's Agent
+        ]
+        print("initializing host agent")
+        hosting_agent_instance = await HostAgent.create(
+            remote_agent_addresses=friend_agent_urls
+        )
+        print("HostAgent initialized")
+        return hosting_agent_instance.create_agent()
+    try:
+        asyncio.run(_async_main())
+    except RuntimeError as e:
+        if "asyncio.run() cannot be called from a running event loop" in str(e):
+            print(
+                f"Warning: Could not initialize HostAgent with asyncio.run(): {e}. "
+                "This can happen if an event loop is already running (e.g., in Jupyter). "
+                "Consider initializing HostAgent within an async function in your application."
+            )
+        else:
+            raise
+
+if __name__ == "__main__":
+    root_agent = _get_initialized_host_agent()
